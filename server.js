@@ -5,9 +5,10 @@ import multer from "multer";
 import { randomUUID } from "crypto";
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
-import { OpenAIEmbeddings } from "@langchain/openai";
+import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
+import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { QdrantVectorStore } from "@langchain/qdrant";
-import { OpenAI } from "openai";
+import { OpenAI } from "openai"; // Keep for type or utility if needed, but we'll use Gemini
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -73,8 +74,9 @@ const documents = new Map(); // collectionName -> { id, name, originalName, page
  * Create OpenAI Embeddings instance (reusable)
  */
 function getEmbeddings() {
-  return new OpenAIEmbeddings({
-    model: "text-embedding-3-large",
+  return new GoogleGenerativeAIEmbeddings({
+    apiKey: process.env.GOOGLE_API_KEY,
+    modelName: "embedding-001", // Standard Gemini embedding model
   });
 }
 
@@ -275,8 +277,12 @@ app.post("/api/chat", async (req, res) => {
 
     const context = contextParts.join("\n\n---\n\n");
 
-    // Step 4: Generate grounded answer
-    const client = new OpenAI();
+    // Step 4: Generate grounded answer via Gemini
+    const model = new ChatGoogleGenerativeAI({
+      apiKey: process.env.GOOGLE_API_KEY,
+      modelName: "gemini-2.0-flash",
+      temperature: 0.3,
+    });
 
     const systemPrompt = `You are DocuMind, an intelligent document assistant. Your purpose is to answer user questions based STRICTLY on the provided document context.
 
@@ -291,17 +297,12 @@ RULES:
 DOCUMENT CONTEXT:
 ${context}`;
 
-    const response = await client.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: question },
-      ],
-      temperature: 0.3, // Low temperature for factual, grounded answers
-      max_tokens: 1500,
-    });
+    const response = await model.invoke([
+      ["system", systemPrompt],
+      ["human", question],
+    ]);
 
-    const answer = response.choices[0].message.content;
+    const answer = response.content;
 
     // Extract source page numbers
     const sources = [

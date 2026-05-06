@@ -8,11 +8,19 @@
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
-  "keywords": ["rag", "notebooklm", "vector-database", "langchain", "openai", "qdrant"],
+  "keywords": [
+    "rag",
+    "notebooklm",
+    "vector-database",
+    "langchain",
+    "openai",
+    "qdrant"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "@langchain/community": "^0.3.0",
+    "@langchain/google-genai": "^2.1.30",
     "@langchain/openai": "^0.3.0",
     "@langchain/qdrant": "^0.1.0",
     "@langchain/textsplitters": "^0.1.0",
