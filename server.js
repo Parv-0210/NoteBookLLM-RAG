@@ -5,10 +5,9 @@ import multer from "multer";
 import { randomUUID } from "crypto";
 import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
-import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
-import { QdrantVectorStore } from "@langchain/qdrant";
-import { OpenAI } from "openai"; // Keep for type or utility if needed, but we'll use Gemini
+import { QdrantClient } from "@qdrant/js-client-rest";
+import Groq from "groq-sdk";
+import { pipeline } from "@xenova/transformers";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -28,7 +27,7 @@ if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Multer setup for file uploads
+// Multer setup
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
@@ -39,13 +38,9 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB max
+  limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = [
-      "application/pdf",
-      "text/plain",
-      "text/markdown",
-    ];
+    const allowedTypes = ["application/pdf", "text/plain", "text/markdown"];
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
@@ -62,45 +57,61 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
 // -------------------------------------------------------------------
-// In-memory document registry
+// Clients
 // -------------------------------------------------------------------
-const documents = new Map(); // collectionName -> { id, name, originalName, pages, chunks, createdAt }
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+const qdrant = new QdrantClient({
+  url: process.env.QDRANT_URL,
+  apiKey: process.env.QDRANT_API_KEY,
+});
+
+// Embedding vector size for all-MiniLM-L6-v2
+const EMBEDDING_SIZE = 384;
+
+// Lazy-load the local embedding model (downloads once, cached)
+let embedder = null;
+async function getEmbedder() {
+  if (!embedder) {
+    console.log("   🤖 Loading local embedding model (first run)...");
+    embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
+    console.log("   ✅ Embedding model ready");
+  }
+  return embedder;
+}
 
 // -------------------------------------------------------------------
-// Shared helpers
+// In-memory document registry
+// -------------------------------------------------------------------
+const documents = new Map();
+
+// -------------------------------------------------------------------
+// Helpers
 // -------------------------------------------------------------------
 
 /**
- * Create OpenAI Embeddings instance (reusable)
+ * Generate embeddings using local all-MiniLM-L6-v2 model (via @xenova/transformers)
+ * Runs fully locally — no API key needed, no quota limits.
+ * Vector size: 384 dimensions
  */
-function getEmbeddings() {
-  return new GoogleGenerativeAIEmbeddings({
-    apiKey: process.env.GOOGLE_API_KEY,
-    modelName: "embedding-001", // Standard Gemini embedding model
-  });
+async function getEmbedding(text) {
+  const embedFn = await getEmbedder();
+  const output = await embedFn(text, { pooling: "mean", normalize: true });
+  return Array.from(output.data);
 }
 
 /**
  * Chunking Strategy — RecursiveCharacterTextSplitter
  * ---------------------------------------------------
- * This is the recommended general-purpose chunking strategy for RAG.
+ * Splits documents using a hierarchy of separators:
+ *   1. \n\n (paragraph boundaries)
+ *   2. \n   (line breaks)
+ *   3. " "  (word boundaries)
+ *   4. ""   (characters — last resort)
  *
- * HOW IT WORKS:
- * 1. It attempts to split text using a hierarchy of separators:
- *    - First by double newlines (\n\n) — paragraph boundaries
- *    - Then by single newlines (\n) — line breaks
- *    - Then by spaces (" ") — word boundaries
- *    - Finally by characters ("") — as a last resort
- * 2. It tries to keep chunks as close to `chunkSize` as possible
- *    while respecting the separator hierarchy.
- * 3. `chunkOverlap` ensures that context near chunk boundaries
- *    is preserved in adjacent chunks, preventing information loss.
- *
- * WHY THESE PARAMETERS:
- * - chunkSize: 1000 — balances granularity with context. Small enough
- *   for precise retrieval, large enough to contain meaningful passages.
- * - chunkOverlap: 200 (20%) — ensures boundary context is preserved.
- *   Critical for sentences that span chunk boundaries.
+ * Parameters:
+ *   chunkSize:    1000 chars — precise retrieval with meaningful context
+ *   chunkOverlap: 200 chars (20%) — prevents info loss at boundaries
  */
 function getTextSplitter() {
   return new RecursiveCharacterTextSplitter({
@@ -111,25 +122,17 @@ function getTextSplitter() {
 }
 
 /**
- * Get Qdrant connection config
+ * Ensure Qdrant collection exists
  */
-function getQdrantConfig(collectionName) {
-  const config = {
-    collectionName,
-  };
-
-  // Support both local Qdrant and Qdrant Cloud
-  if (process.env.QDRANT_URL) {
-    config.url = process.env.QDRANT_URL;
-  } else {
-    config.url = "http://localhost:6333";
+async function ensureCollection(collectionName) {
+  try {
+    await qdrant.getCollection(collectionName);
+  } catch {
+    await qdrant.createCollection(collectionName, {
+      vectors: { size: EMBEDDING_SIZE, distance: "Cosine" },
+    });
+    console.log(`   📦 Created Qdrant collection: ${collectionName}`);
   }
-
-  if (process.env.QDRANT_API_KEY) {
-    config.apiKey = process.env.QDRANT_API_KEY;
-  }
-
-  return config;
 }
 
 // -------------------------------------------------------------------
@@ -138,13 +141,7 @@ function getQdrantConfig(collectionName) {
 
 /**
  * POST /api/upload
- * ----------------
- * Handles document upload and the full ingestion pipeline:
- * 1. Receive file (PDF or TXT)
- * 2. Load & parse content
- * 3. Chunk using RecursiveCharacterTextSplitter
- * 4. Generate embeddings via OpenAI
- * 5. Store in Qdrant vector database
+ * Full ingestion pipeline: load → chunk → embed (local) → store (Qdrant)
  */
 app.post("/api/upload", upload.single("document"), async (req, res) => {
   try {
@@ -159,45 +156,49 @@ app.post("/api/upload", upload.single("document"), async (req, res) => {
     console.log(`\n📄 Processing: ${originalName}`);
     console.log(`   Collection: ${collectionName}`);
 
-    // Step 1: Load the document
+    // Step 1: Load document
     let docs;
     if (req.file.mimetype === "application/pdf") {
       const loader = new PDFLoader(filePath);
       docs = await loader.load();
     } else {
-      // Plain text or markdown
       const text = fs.readFileSync(filePath, "utf-8");
-      docs = [
-        {
-          pageContent: text,
-          metadata: { source: originalName, loc: { pageNumber: 1 } },
-        },
-      ];
+      docs = [{ pageContent: text, metadata: { source: originalName, loc: { pageNumber: 1 } } }];
     }
 
     console.log(`   📖 Loaded ${docs.length} page(s)`);
 
-    // Step 2: Chunk the documents
+    // Step 2: Chunk
     const splitter = getTextSplitter();
     const chunks = await splitter.splitDocuments(docs);
-
     console.log(`   ✂️  Split into ${chunks.length} chunks`);
-    console.log(
-      `   📏 Chunk sizes: min=${Math.min(...chunks.map((c) => c.pageContent.length))}, max=${Math.max(...chunks.map((c) => c.pageContent.length))}, avg=${Math.round(chunks.map((c) => c.pageContent.length).reduce((a, b) => a + b, 0) / chunks.length)}`
-    );
 
-    // Step 3 & 4: Embed and store in Qdrant
-    const embeddings = getEmbeddings();
-    const qdrantConfig = getQdrantConfig(collectionName);
+    // Step 3: Create Qdrant collection
+    await ensureCollection(collectionName);
 
-    await QdrantVectorStore.fromDocuments(chunks, embeddings, qdrantConfig);
+    // Step 4: Embed each chunk using local model and upsert into Qdrant
+    const points = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      const embedding = await getEmbedding(chunk.pageContent);
+      points.push({
+        id: i,
+        vector: embedding,
+        payload: {
+          text: chunk.pageContent,
+          page: chunk.metadata?.loc?.pageNumber || chunk.metadata?.page || 1,
+          source: originalName,
+        },
+      });
+    }
 
-    console.log(`   ✅ Indexed into Qdrant`);
+    await qdrant.upsert(collectionName, { points });
+    console.log(`   ✅ Indexed ${points.length} chunks into Qdrant`);
 
-    // Step 5: Register the document
+    // Register document
     const docInfo = {
       id: collectionName,
-      name: originalName.replace(/\.[^/.]+$/, ""), // Remove extension
+      name: originalName.replace(/\.[^/.]+$/, ""),
       originalName,
       pages: docs.length,
       chunks: chunks.length,
@@ -205,7 +206,6 @@ app.post("/api/upload", upload.single("document"), async (req, res) => {
     };
     documents.set(collectionName, docInfo);
 
-    // Cleanup uploaded file
     fs.unlinkSync(filePath);
 
     res.json({
@@ -215,126 +215,87 @@ app.post("/api/upload", upload.single("document"), async (req, res) => {
     });
   } catch (error) {
     console.error("Upload error:", error);
-    res.status(500).json({
-      error: `Failed to process document: ${error.message}`,
-    });
+    res.status(500).json({ error: `Failed to process document: ${error.message}` });
   }
 });
 
 /**
  * POST /api/chat
- * ---------------
- * Handles user queries against an uploaded document:
- * 1. Receive question + document collection ID
- * 2. Retrieve top-k relevant chunks from Qdrant
- * 3. Build a prompt with retrieved context
- * 4. Generate grounded answer via OpenAI LLM
+ * Retrieval + grounded generation via Groq LLM
  */
 app.post("/api/chat", async (req, res) => {
   try {
     const { question, documentId } = req.body;
 
     if (!question || !documentId) {
-      return res.status(400).json({
-        error: "Both 'question' and 'documentId' are required.",
-      });
+      return res.status(400).json({ error: "Both 'question' and 'documentId' are required." });
     }
 
     console.log(`\n💬 Question: "${question}"`);
-    console.log(`   Document: ${documentId}`);
 
-    // Step 1: Connect to existing Qdrant collection
-    const embeddings = getEmbeddings();
-    const qdrantConfig = getQdrantConfig(documentId);
+    // Step 1: Embed the question using local model
+    const queryEmbedding = await getEmbedding(question);
 
-    const vectorStore = await QdrantVectorStore.fromExistingCollection(
-      embeddings,
-      qdrantConfig
-    );
+    // Step 2: Search Qdrant for top-4 similar chunks
+    const searchResult = await qdrant.search(documentId, {
+      vector: queryEmbedding,
+      limit: 4,
+      with_payload: true,
+    });
 
-    // Step 2: Retrieve top-k relevant chunks
-    const retriever = vectorStore.asRetriever({ k: 4 });
-    const retrievedChunks = await retriever.invoke(question);
+    console.log(`   🔍 Retrieved ${searchResult.length} chunks`);
 
-    console.log(`   🔍 Retrieved ${retrievedChunks.length} chunks`);
-
-    if (retrievedChunks.length === 0) {
+    if (searchResult.length === 0) {
       return res.json({
-        answer:
-          "I couldn't find any relevant information in the document to answer your question. Please try rephrasing or asking something else about the document.",
+        answer: "I couldn't find relevant information in the document. Please try rephrasing your question.",
         sources: [],
       });
     }
 
-    // Step 3: Build context string with page numbers
-    const contextParts = retrievedChunks.map((chunk, i) => {
-      const pageNum =
-        chunk.metadata?.loc?.pageNumber ||
-        chunk.metadata?.page ||
-        "unknown";
-      return `[Chunk ${i + 1} — Page ${pageNum}]\n${chunk.pageContent}`;
+    // Step 3: Build context
+    const contextParts = searchResult.map((hit, i) => {
+      return `[Chunk ${i + 1} — Page ${hit.payload.page}]\n${hit.payload.text}`;
     });
-
     const context = contextParts.join("\n\n---\n\n");
 
-    // Step 4: Generate grounded answer via Gemini
-    const model = new ChatGoogleGenerativeAI({
-      apiKey: process.env.GOOGLE_API_KEY,
-      modelName: "gemini-2.0-flash",
+    // Step 4: Generate grounded answer using Groq (llama-3.3-70b — free & fast)
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
       temperature: 0.3,
-    });
-
-    const systemPrompt = `You are DocuMind, an intelligent document assistant. Your purpose is to answer user questions based STRICTLY on the provided document context.
+      max_tokens: 1500,
+      messages: [
+        {
+          role: "system",
+          content: `You are DocuMind, an intelligent document assistant. Answer questions based STRICTLY on the document context below.
 
 RULES:
-1. ONLY answer based on the context provided below. Do NOT use your own knowledge.
-2. If the context does not contain enough information to answer the question, say so clearly.
-3. When referencing information, mention the page number(s) where it was found.
-4. Provide clear, well-structured answers. Use bullet points or numbered lists when appropriate.
-5. If you quote directly from the document, use quotation marks.
-6. Do NOT make up or hallucinate information that is not in the context.
+1. ONLY answer based on the context. Do NOT use your general knowledge.
+2. If the context doesn't have enough info, say so clearly.
+3. Mention page numbers when referencing information.
+4. Be clear and well-structured. Use bullet points when appropriate.
+5. Do NOT hallucinate or make up information.
 
 DOCUMENT CONTEXT:
-${context}`;
+${context}`,
+        },
+        { role: "user", content: question },
+      ],
+    });
 
-    const response = await model.invoke([
-      ["system", systemPrompt],
-      ["human", question],
-    ]);
-
-    const answer = response.content;
-
-    // Extract source page numbers
-    const sources = [
-      ...new Set(
-        retrievedChunks
-          .map(
-            (c) =>
-              c.metadata?.loc?.pageNumber || c.metadata?.page || null
-          )
-          .filter(Boolean)
-      ),
-    ].sort((a, b) => a - b);
+    const answer = completion.choices[0].message.content;
+    const sources = [...new Set(searchResult.map((h) => h.payload.page))].sort((a, b) => a - b);
 
     console.log(`   ✅ Answer generated (${answer.length} chars)`);
 
-    res.json({
-      answer,
-      sources,
-      chunksUsed: retrievedChunks.length,
-    });
+    res.json({ answer, sources, chunksUsed: searchResult.length });
   } catch (error) {
     console.error("Chat error:", error);
-    res.status(500).json({
-      error: `Failed to generate answer: ${error.message}`,
-    });
+    res.status(500).json({ error: `Failed to generate answer: ${error.message}` });
   }
 });
 
 /**
  * GET /api/documents
- * -------------------
- * Returns the list of uploaded and processed documents.
  */
 app.get("/api/documents", (req, res) => {
   const docList = Array.from(documents.values()).sort(
@@ -345,14 +306,13 @@ app.get("/api/documents", (req, res) => {
 
 /**
  * DELETE /api/documents/:id
- * --------------------------
- * Remove a document from the registry.
  */
-app.delete("/api/documents/:id", (req, res) => {
+app.delete("/api/documents/:id", async (req, res) => {
   const { id } = req.params;
   if (documents.has(id)) {
     documents.delete(id);
-    res.json({ success: true, message: "Document removed." });
+    try { await qdrant.deleteCollection(id); } catch (_) {}
+    res.json({ success: true });
   } else {
     res.status(404).json({ error: "Document not found." });
   }
@@ -369,10 +329,9 @@ app.listen(PORT, () => {
 ║   ─────────────────────────                      ║
 ║   Running on: http://localhost:${PORT}              ║
 ║                                                  ║
-║   Endpoints:                                     ║
-║     POST /api/upload     — Upload a document     ║
-║     POST /api/chat       — Ask a question        ║
-║     GET  /api/documents  — List documents        ║
+║   Embeddings : all-MiniLM-L6-v2 (local)         ║
+║   LLM        : Groq llama-3.3-70b (free)        ║
+║   Vector DB  : Qdrant Cloud                      ║
 ║                                                  ║
 ╚══════════════════════════════════════════════════╝
   `);
