@@ -135,7 +135,8 @@ async function handleFileUpload(file) {
     progressStatus.textContent = "Done!";
 
     // Add document to list
-    documents.push(data.document);
+    const docWithContext = { ...data.document, context: data.context };
+    documents.push(docWithContext);
     chatHistory[data.document.id] = [];
     renderDocumentList();
 
@@ -432,12 +433,14 @@ async function sendMessage() {
   scrollToBottom();
 
   try {
+    const activeDoc = documents.find(d => d.id === activeDocumentId);
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         question,
         documentId: activeDocumentId,
+        context: activeDoc ? activeDoc.context : ""
       }),
     });
 
