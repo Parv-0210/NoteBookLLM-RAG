@@ -32,9 +32,9 @@
   --text-tertiary: #6b6b82;
   --text-muted: #4a4a60;
 
-  --accent-primary: #818cf8;
-  --accent-secondary: #c084fc;
-  --accent-gradient: linear-gradient(135deg, #818cf8 0%, #c084fc 100%);
+  --accent-primary: #10b981;
+  --accent-secondary: #047857;
+  --accent-gradient: linear-gradient(135deg, #10b981 0%, #047857 100%);
   --accent-glow: rgba(129, 140, 248, 0.15);
   --accent-glow-strong: rgba(129, 140, 248, 0.3);
 
